@@ -91,6 +91,39 @@ impl ClientHandle {
 type Reader = io::Lines<io::BufReader<io::ReadHalf<net::TcpStream>>>;
 type Writer = io::WriteHalf<net::TcpStream>;
 
+pub struct QuirckyBuilder {
+    nick: String,
+    username: Option<String>,
+    realname: Option<String>,
+}
+
+impl QuirckyBuilder {
+    pub fn new(nick: impl Into<String>) -> Self {
+        Self {
+            nick: nick.into(),
+            username: None,
+            realname: None,
+        }
+    }
+
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    pub fn realname(mut self, realname: impl Into<String>) -> Self {
+        self.realname = Some(realname.into());
+        self
+    }
+
+    pub async fn connect(self, addr: impl net::ToSocketAddrs) -> anyhow::Result<Quircky> {
+        let username = self.username.unwrap_or_else(|| self.nick.clone());
+        let realname = self.realname.unwrap_or_else(|| self.nick.clone());
+
+        Quircky::connect_inner(addr, &self.nick, &username, &realname).await
+    }
+}
+
 pub struct Quircky {
     reader: Reader,
     writer: Writer,
@@ -100,9 +133,14 @@ pub struct Quircky {
 }
 
 impl Quircky {
-    pub async fn connect(
+    pub fn builder(nick: impl Into<String>) -> QuirckyBuilder {
+        QuirckyBuilder::new(nick)
+    }
+
+    async fn connect_inner(
         addr: impl net::ToSocketAddrs,
         nick: &str,
+        username: &str,
         realname: &str,
     ) -> anyhow::Result<Self> {
         info!("connecting...");
@@ -125,7 +163,7 @@ impl Quircky {
             .await?;
 
         quircky
-            .write_message(IrcCommand::USER(nick.into(), "0".into(), realname.into()).into())
+            .write_message(IrcCommand::USER(username.into(), "0".into(), realname.into()).into())
             .await?;
 
         Ok(quircky)
@@ -211,7 +249,10 @@ impl Quircky {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let client = Quircky::connect("irc.libera.chat:6667", "blahblah123", "blahblah123").await?;
+    let client = Quircky::builder("blahblah123")
+        .connect("irc.libera.chat:6667")
+        .await?;
+
     let (handle, mut events) = client.run();
 
     handle.join("#rust").await?;
