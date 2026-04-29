@@ -4,6 +4,7 @@ use tokio::{
     net,
     sync::mpsc,
 };
+use tracing::{info, trace, warn};
 
 enum Command {
     Nick(String),
@@ -104,7 +105,10 @@ impl Quircky {
         nick: &str,
         realname: &str,
     ) -> anyhow::Result<Self> {
+        info!("connecting...");
         let stream = net::TcpStream::connect(addr).await?;
+        info!("connected, sending handshake");
+
         let (reader, writer) = io::split(stream);
         let reader = io::BufReader::new(reader).lines();
         let (tx, rx) = mpsc::channel(32);
@@ -128,6 +132,7 @@ impl Quircky {
     }
 
     async fn write_message(&mut self, msg: Message) -> anyhow::Result<()> {
+        trace!(raw = %msg, "sending message");
         self.writer.write_all(msg.to_string().as_bytes()).await?;
 
         Ok(())
@@ -141,9 +146,22 @@ impl Quircky {
         let (event_tx, event_rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
-            while let Ok(Some(event)) = self.next_event().await {
-                if event_tx.send(event).await.is_err() {
-                    break;
+            loop {
+                match self.next_event().await {
+                    Ok(Some(event)) => {
+                        if event_tx.send(event).await.is_err() {
+                            warn!("event receiver dropped, shutting down");
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        info!("connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "error in event loop");
+                        break;
+                    }
                 }
             }
         });
@@ -159,6 +177,8 @@ impl Quircky {
                         return Ok(None);
                     };
 
+                    trace!(raw = %line, "received line");
+
                     let msg: Message = line.parse()?;
 
                     // ping handled internally
@@ -169,8 +189,9 @@ impl Quircky {
                         continue;
                     }
 
-                    if let Some(event) = Event::from_message(msg) {
-                        return Ok(Some(event));
+                    match Event::from_message(msg) {
+                        Some(event) => return Ok(Some(event)),
+                        None => trace!(raw = %line, "ignored message"),
                     }
                 }
 
@@ -188,6 +209,8 @@ impl Quircky {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let client = Quircky::connect("irc.libera.chat:6667", "blahblah123", "blahblah123").await?;
     let (handle, mut events) = client.run();
 
