@@ -1,3 +1,4 @@
+use irc_proto::{Command as IrcCommand, Message, Prefix};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt},
     net,
@@ -8,16 +9,14 @@ enum Command {
     Nick(String),
     Join(String),
     Privmsg { target: String, text: String },
-    Pong(String),
 }
 
 impl Command {
-    fn into_raw(self) -> String {
+    fn into_message(self) -> Message {
         match self {
-            Self::Nick(nick) => format!("NICK {nick}\r\n"),
-            Self::Join(channel) => format!("JOIN {channel}\r\n"),
-            Self::Privmsg { target, text } => format!("PRIVMSG {target} :{text}\r\n"),
-            Self::Pong(token) => format!("PONG :{token}\r\n"),
+            Self::Nick(nick) => IrcCommand::NICK(nick).into(),
+            Self::Join(channel) => IrcCommand::JOIN(channel, None, None).into(),
+            Self::Privmsg { target, text } => IrcCommand::PRIVMSG(target, text).into(),
         }
     }
 }
@@ -29,34 +28,32 @@ pub enum Event {
         text: String,
     },
     Joined {
+        who: String,
         channel: String,
     },
-    Unknown(String),
+}
+
+fn nick_from_prefix(prefix: Option<Prefix>) -> Option<String> {
+    match prefix {
+        Some(Prefix::Nickname(nick, _, _)) => Some(nick),
+        _ => None,
+    }
 }
 
 impl Event {
-    // TODO: better parsing
-    fn parse(line: &str) -> Self {
-        let parts: Vec<&str> = line.splitn(4, ' ').collect();
-
-        if parts.len() >= 4 && parts[1] == "PRIVMSG" {
-            let from = parts[0]
-                .trim_start_matches(':')
-                .split('!')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let target = parts[2].to_string();
-            let text = parts[3].trim_start_matches(':').to_string();
-            return Self::Message { from, target, text };
+    fn from_message(msg: Message) -> Option<Self> {
+        match msg.command {
+            IrcCommand::PRIVMSG(target, text) => Some(Self::Message {
+                from: nick_from_prefix(msg.prefix)?,
+                target,
+                text,
+            }),
+            IrcCommand::JOIN(channel, _, _) => Some(Self::Joined {
+                who: nick_from_prefix(msg.prefix)?,
+                channel,
+            }),
+            _ => None,
         }
-
-        if parts.len() >= 3 && parts[1] == "JOIN" {
-            let channel = parts[2].trim_start_matches(':').to_string();
-            return Self::Joined { channel };
-        }
-
-        Self::Unknown(line.to_string())
     }
 }
 
@@ -119,20 +116,24 @@ impl Quircky {
             rx,
         };
 
-        quircky.write_raw(format!("NICK {nick}\r\n")).await?;
         quircky
-            .write_raw(format!("USER {nick} 0 * :{realname}\r\n"))
+            .write_message(IrcCommand::NICK(nick.into()).into())
+            .await?;
+
+        quircky
+            .write_message(IrcCommand::USER(nick.into(), "0".into(), realname.into()).into())
             .await?;
 
         Ok(quircky)
     }
 
-    async fn write_raw(&mut self, line: String) -> anyhow::Result<()> {
-        self.writer.write_all(line.as_bytes()).await?;
+    async fn write_message(&mut self, msg: Message) -> anyhow::Result<()> {
+        self.writer.write_all(msg.to_string().as_bytes()).await?;
 
         Ok(())
     }
 
+    #[must_use]
     pub fn run(mut self) -> (ClientHandle, mpsc::Receiver<Event>) {
         let handle = ClientHandle {
             tx: self.tx.clone(),
@@ -150,7 +151,7 @@ impl Quircky {
         (handle, event_rx)
     }
 
-    pub async fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
+    async fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
         loop {
             tokio::select! {
                 line = self.reader.next_line() => {
@@ -158,12 +159,19 @@ impl Quircky {
                         return Ok(None);
                     };
 
-                    if let Some(token) = line.strip_prefix("PING :") {
-                        self.tx.send(Command::Pong(token.into())).await?;
+                    let msg: Message = line.parse()?;
+
+                    // ping handled internally
+                    if let IrcCommand::PING(token, _) = msg.command {
+                        let pong: Message = IrcCommand::PONG(token, None).into();
+                        self.writer.write_all(pong.to_string().as_bytes()).await?;
+
                         continue;
                     }
 
-                    return Ok(Some(Event::parse(&line)));
+                    if let Some(event) = Event::from_message(msg) {
+                        return Ok(Some(event));
+                    }
                 }
 
                 cmd = self.rx.recv() => {
@@ -171,7 +179,7 @@ impl Quircky {
                         return Ok(None);
                     };
 
-                    self.writer.write_all(cmd.into_raw().as_bytes()).await?;
+                    self.write_message(cmd.into_message()).await?;
                 }
             }
         }
@@ -188,8 +196,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(event) = events.recv().await {
         match event {
             Event::Message { from, target, text } => println!("<{from} -> {target}> {text}"),
-            Event::Joined { channel } => println!("* joined {channel}"),
-            Event::Unknown(line) => eprintln!("?? {line}"),
+            Event::Joined { who, channel } => println!("* {who} joined {channel}"),
         }
     }
 
