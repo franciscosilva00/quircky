@@ -32,6 +32,7 @@ pub enum Event {
         who: String,
         channel: String,
     },
+    Ping,
 }
 
 fn nick_from_prefix(prefix: Option<Prefix>) -> Option<String> {
@@ -53,6 +54,7 @@ impl Event {
                 who: nick_from_prefix(msg.prefix)?,
                 channel,
             }),
+            IrcCommand::PING(_, _) => Some(Self::Ping),
             _ => None,
         }
     }
@@ -261,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         match event {
             Event::Message { from, target, text } => println!("<{from} -> {target}> {text}"),
             Event::Joined { who, channel } => println!("* {who} joined {channel}"),
+            Event::Ping => {}
         }
     }
 
