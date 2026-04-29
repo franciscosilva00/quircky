@@ -133,13 +133,21 @@ impl Quircky {
         Ok(())
     }
 
-    #[must_use]
-    pub fn run(self) -> (ClientHandle, Self) {
+    pub fn run(mut self) -> (ClientHandle, mpsc::Receiver<Event>) {
         let handle = ClientHandle {
             tx: self.tx.clone(),
         };
+        let (event_tx, event_rx) = mpsc::channel(32);
 
-        (handle, self)
+        tokio::spawn(async move {
+            while let Ok(Some(event)) = self.next_event().await {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        (handle, event_rx)
     }
 
     pub async fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
@@ -173,14 +181,11 @@ impl Quircky {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let client = Quircky::connect("irc.libera.chat:6667", "blahblah123", "blahblah123").await?;
+    let (handle, mut events) = client.run();
 
-    let (handle, mut client) = client.run();
+    handle.join("#rust").await?;
 
-    tokio::spawn(async move {
-        handle.join("#rust").await.unwrap();
-    });
-
-    while let Some(event) = client.next_event().await? {
+    while let Some(event) = events.recv().await {
         match event {
             Event::Message { from, target, text } => println!("<{from} -> {target}> {text}"),
             Event::Joined { channel } => println!("* joined {channel}"),
