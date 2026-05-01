@@ -108,11 +108,13 @@ impl QuirckyBuilder {
         }
     }
 
+    #[must_use]
     pub fn username(mut self, username: impl Into<String>) -> Self {
         self.username = Some(username.into());
         self
     }
 
+    #[must_use]
     pub fn realname(mut self, realname: impl Into<String>) -> Self {
         self.realname = Some(realname.into());
         self
@@ -227,10 +229,11 @@ impl Quircky {
                         self.writer.write_all(pong.to_string().as_bytes()).await?;
                     }
 
-                    match Event::from_message(msg) {
-                        Some(event) => return Ok(Some(event)),
-                        None => trace!(raw = %line, "ignored message"),
+                    if let Some(event) = Event::from_message(msg) {
+                        return Ok(Some(event));
                     }
+
+                    trace!(raw = %line, "ignored message");
                 }
 
                 cmd = self.rx.recv() => {
