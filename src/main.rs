@@ -221,12 +221,10 @@ impl Quircky {
 
                     let msg: Message = line.parse()?;
 
-                    // ping handled internally
-                    if let IrcCommand::PING(token, _) = msg.command {
-                        let pong: Message = IrcCommand::PONG(token, None).into();
+                    // ping handled internally, still surfaced to user
+                    if let IrcCommand::PING(ref token, _) = msg.command {
+                        let pong: Message = IrcCommand::PONG(token.clone(), None).into();
                         self.writer.write_all(pong.to_string().as_bytes()).await?;
-
-                        continue;
                     }
 
                     match Event::from_message(msg) {
@@ -263,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
         match event {
             Event::Message { from, target, text } => println!("<{from} -> {target}> {text}"),
             Event::Joined { who, channel } => println!("* {who} joined {channel}"),
-            Event::Ping => {}
+            Event::Ping => println!("pinged"),
         }
     }
 
