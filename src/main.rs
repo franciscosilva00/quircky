@@ -1,4 +1,4 @@
-use irc_proto::{Command as IrcCommand, Message, Prefix};
+use irc_proto::{Command as IrcCommand, Message, Prefix, Response};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt},
     net,
@@ -22,6 +22,23 @@ impl Command {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NickPrefix {
+    Op,
+    Voice,
+    None,
+}
+
+impl NickPrefix {
+    const fn from_char(c: char) -> Self {
+        match c {
+            '@' => Self::Op,
+            '+' => Self::Voice,
+            _ => Self::None,
+        }
+    }
+}
+
 pub enum Event {
     Message {
         from: String,
@@ -32,7 +49,51 @@ pub enum Event {
         who: String,
         channel: String,
     },
+    Part {
+        who: String,
+        channel: String,
+        reason: Option<String>,
+    },
+    Quit {
+        who: String,
+        reason: Option<String>,
+    },
+    NickChange {
+        old: String,
+        new: String,
+    },
+    Notice {
+        from: String,
+        target: String,
+        text: String,
+    },
     Ping,
+    Error(String),
+
+    Ready {
+        nick: String,
+        message: String,
+    },
+    NickInUse {
+        attempted: String,
+    },
+    NickError {
+        attempted: String,
+        reason: String,
+    },
+    Topic {
+        channel: String,
+        topic: String,
+    },
+    NamesReply {
+        channel: String,
+        names: Vec<(String, NickPrefix)>,
+    },
+    NamesEnd {
+        channel: String,
+    },
+    Motd(String),
+    MotdEnd,
 }
 
 fn nick_from_prefix(prefix: Option<Prefix>) -> Option<String> {
@@ -40,6 +101,21 @@ fn nick_from_prefix(prefix: Option<Prefix>) -> Option<String> {
         Some(Prefix::Nickname(nick, _, _)) => Some(nick),
         _ => None,
     }
+}
+
+fn parse_names(raw: &str) -> Vec<(String, NickPrefix)> {
+    raw.split_whitespace()
+        .map(|s| {
+            let first = s.chars().next().unwrap_or(' ');
+            let prefix = NickPrefix::from_char(first);
+            let nick = if prefix == NickPrefix::None {
+                s.to_string()
+            } else {
+                s[1..].to_string()
+            };
+            (nick, prefix)
+        })
+        .collect()
 }
 
 impl Event {
@@ -54,7 +130,79 @@ impl Event {
                 who: nick_from_prefix(msg.prefix)?,
                 channel,
             }),
+            IrcCommand::PART(channel, reason) => Some(Self::Part {
+                who: nick_from_prefix(msg.prefix)?,
+                channel,
+                reason,
+            }),
+            IrcCommand::QUIT(reason) => Some(Self::Quit {
+                who: nick_from_prefix(msg.prefix)?,
+                reason,
+            }),
+            IrcCommand::NICK(new) => Some(Self::NickChange {
+                old: nick_from_prefix(msg.prefix)?,
+                new,
+            }),
+            IrcCommand::NOTICE(target, text) => Some(Self::Notice {
+                from: nick_from_prefix(msg.prefix).unwrap_or_else(|| "server".into()),
+                target,
+                text,
+            }),
             IrcCommand::PING(_, _) => Some(Self::Ping),
+            IrcCommand::ERROR(msg) => Some(Self::Error(msg)),
+
+            IrcCommand::Response(code, params) => Self::from_numeric(code, params),
+
+            _ => None,
+        }
+    }
+
+    fn from_numeric(code: Response, mut params: Vec<String>) -> Option<Self> {
+        match code {
+            Response::RPL_WELCOME => Some(Self::Ready {
+                nick: params.first()?.clone(),
+                message: params.into_iter().last()?,
+            }),
+
+            Response::RPL_TOPIC => {
+                let topic = params.pop()?;
+                let channel = params.into_iter().nth(1)?;
+                Some(Self::Topic { channel, topic })
+            }
+
+            Response::RPL_NAMREPLY => {
+                let names_raw = params.pop()?;
+                let channel = params.into_iter().last()?;
+                Some(Self::NamesReply {
+                    channel,
+                    names: parse_names(&names_raw),
+                })
+            }
+
+            Response::RPL_ENDOFNAMES => {
+                let channel = params.into_iter().nth(1)?;
+                Some(Self::NamesEnd { channel })
+            }
+
+            Response::RPL_MOTD => {
+                let text = params.into_iter().last()?;
+                Some(Self::Motd(text))
+            }
+
+            Response::RPL_ENDOFMOTD => Some(Self::MotdEnd),
+
+            Response::ERR_NICKNAMEINUSE => {
+                let attempted = params.into_iter().nth(1)?;
+                Some(Self::NickInUse { attempted })
+            }
+
+            Response::ERR_NONICKNAMEGIVEN | Response::ERR_ERRONEOUSNICKNAME => {
+                let mut it = params.into_iter();
+                let attempted = it.nth(1).unwrap_or_default();
+                let reason = it.last().unwrap_or_default();
+                Some(Self::NickError { attempted, reason })
+            }
+
             _ => None,
         }
     }
@@ -258,13 +406,58 @@ async fn main() -> anyhow::Result<()> {
 
     let (handle, mut events) = client.run();
 
-    handle.join("#rust").await?;
+    // discard events until we're registered
+    while let Some(event) = events.recv().await {
+        if let Event::Ready { .. } = event {
+            handle.join("#rust").await?;
+            break;
+        }
+    }
 
     while let Some(event) = events.recv().await {
         match event {
             Event::Message { from, target, text } => println!("<{from} -> {target}> {text}"),
             Event::Joined { who, channel } => println!("* {who} joined {channel}"),
+            Event::Part {
+                who,
+                channel,
+                reason: Some(reason),
+            } => println!("* {who} left {channel} ({reason})"),
+            Event::Part {
+                who,
+                channel,
+                reason: None,
+            } => println!("* {who} left {channel}"),
+            Event::Quit {
+                who,
+                reason: Some(reason),
+            } => println!("* {who} quit ({reason})"),
+            Event::Quit { who, reason: None } => println!("* {who} quit"),
+            Event::NickChange { old, new } => println!("* {old} is now known as {new}"),
+            Event::Notice { from, target, text } => println!("[{from} -> {target}] {text}"),
             Event::Ping => println!("pinged"),
+            Event::Error(msg) => println!("error: {msg}"),
+            Event::Ready { nick, message } => println!("* ready as {nick}: {message}"),
+            Event::NickInUse { attempted } => println!("* nick {attempted} is already in use"),
+            Event::NickError { attempted, reason } => {
+                println!("* nick {attempted} error: {reason}");
+            }
+            Event::Topic { channel, topic } => println!("* topic for {channel}: {topic}"),
+            Event::NamesReply { channel, names } => {
+                let formatted = names
+                    .iter()
+                    .map(|(nick, prefix)| match prefix {
+                        NickPrefix::Op => format!("@{nick}"),
+                        NickPrefix::Voice => format!("+{nick}"),
+                        NickPrefix::None => nick.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("* users in {channel}: {formatted}");
+            }
+            Event::NamesEnd { channel } => println!("* end of names for {channel}"),
+            Event::Motd(line) => println!("motd: {line}"),
+            Event::MotdEnd => println!("* end of motd"),
         }
     }
 
